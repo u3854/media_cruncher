@@ -511,8 +511,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "media_cruncher"
-version = "0.1.0"
+name = "media-cruncher"
+version = "0.3.0"
 dependencies = [
  "clap",
  "indicatif",

@@ -29,7 +29,7 @@ struct Args {
     path: String,
 
     /// Compression preset: 'mobile' or 'full-hd'
-    #[arg(short = 'm', long = "mode", default_value = "full-hd")]
+    #[arg(short = 'm', long = "mode")]
     mode: String,
 }
 

@@ -1,6 +1,10 @@
 mod compressors;
 use compressors::{compress_audio, compress_image, compress_video};
 
+mod archive; // Tell Rust our new module exists
+use archive::{extract_zip, repack_zip};
+
+use tempfile::TempDir;
 use walkdir::{WalkDir, DirEntry};
 use std::path::{Path, PathBuf};
 use std::ffi::OsStr;
@@ -18,7 +22,7 @@ use clap::Parser;
 // The `///` comments here are special. `clap` actually reads them 
 // and turns them into the --help menu text in your terminal!
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A media cruncher for Ren'Py games")]
+#[command(author, version, about = "A simple media cruncher (!! WILL REPLACE ORIGINAL !!)")]
 struct Args {
     /// The target directory or zip file to process
     #[arg(short = 'p', long = "path", default_value = ".")] // <-- Added default_value
@@ -129,7 +133,41 @@ fn main() -> () {
     println!("All dependencies found! Starting file scan...\n");
     println!("🚀 Rayon parallel engine initialized with {} worker threads.\n", rayon::current_num_threads());
 
-    let target_dir: &str = &args.path;
+    // --- NEW ZIP INTERCEPTION LOGIC ---
+    let input_path: &Path = Path::new(&args.path);
+    let is_zip: bool = input_path.is_file() && 
+        (input_path.extension() == Some(OsStr::new("zip")) || 
+        input_path.extension() == Some(OsStr::new("cbz")));
+
+    // We declare a variable to hold our TempDir. It's an Option because we 
+    // only create it if the input is actually a zip file.
+    let _temp_dir_holder: Option<TempDir>; 
+    let mut target_dir_path: PathBuf = PathBuf::from(&args.path);
+
+    if is_zip {
+        println!("Identified archive file: {}", input_path.display());
+        
+        // Create the temporary directory securely
+        let temp_dir: TempDir = tempfile::Builder::new()
+            .prefix("media_cruncher_")
+            .tempdir()
+            .expect("Failed to create temporary directory");
+            
+        // Extract the zip into the temp directory
+        extract_zip(input_path, temp_dir.path()).expect("Failed to extract zip file");
+        
+        // Change our target directory so WalkDir processes the temp folder instead!
+        target_dir_path = temp_dir.path().to_path_buf();
+        
+        // Keep the TempDir alive by moving it into our holder variable
+        _temp_dir_holder = Some(temp_dir);
+    } else {
+        _temp_dir_holder = None;
+    }
+
+    // Now, instead of &args.path, WalkDir will use our target_dir_path 
+    // (which is either the original folder, or our new temporary extracted folder).
+    let target_dir: &str = target_dir_path.to_str().expect("Invalid path"); 
     
     // Load our configuration dynamically based on the user's -m choice
     let config: CompressionConfig = CompressionConfig::new(&args.mode);
@@ -313,4 +351,14 @@ fn main() -> () {
         println!("  Final Size    : {}", format_bytes(final_total));
         println!("  Space Saved   : {} ({:.1}% reduction)", format_bytes(saved_bytes), reduction_percent);
     }
+    // --- REPACK ZIP IF NECESSARY ---
+    if is_zip {
+        // If it was a zip file, target_dir_path is pointing to our temp folder.
+        // We pack it back into the original input_path.
+        repack_zip(&target_dir_path, input_path).expect("Failed to repack zip file");
+        println!("✅ Successfully repacked archive!");
+    }
+    
+    // Right here, when the main function ends, _temp_dir_holder goes out of scope.
+    // Rust automatically deletes the temporary directory and all its contents!
 }

@@ -22,15 +22,21 @@ use clap::Parser;
 // The `///` comments here are special. `clap` actually reads them 
 // and turns them into the --help menu text in your terminal!
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A simple media cruncher (!! WILL REPLACE ORIGINAL !!)")]
+#[command(author, version, about = "A simple media cruncher")]
 struct Args {
-    /// The target directory or zip file to process
-    #[arg(short = 'p', long = "path", default_value = ".")] // <-- Added default_value
+    #[arg(short = 'p', long = "path", default_value = ".")]
     path: String,
 
-    /// Compression preset: 'mobile' or 'full-hd'
-    #[arg(short = 'm', long = "mode")]
+    #[arg(short = 'm', long = "mode", default_value = "full-hd")]
     mode: String,
+
+    /// Optional target resolution: '1080p' or '720p'
+    #[arg(short = 'r', long = "resolution")]
+    resolution: Option<String>,
+
+    /// Number of threads: 'max' or a specific number
+    #[arg(short = 't', long = "threads")]
+    threads: Option<String>,
 }
 
 // --- DEFINING OUR TYPES ---
@@ -45,26 +51,34 @@ enum MediaType {
 
 #[derive(Debug)]
 pub struct CompressionConfig {
-    image_quality: u8,
-    audio_bitrate_k: u8,
-    video_q_factor: u8,
+    pub img_webp_q: u8,
+    pub img_jpg_q: u8,
+    pub audio_bitrate_k: u8,
+    pub video_x264_crf: u8,
+    pub video_vp9_crf: u8,
+    pub max_resolution_px: Option<u32>, // Holds the longest-edge limit
 }
 
 impl CompressionConfig {
-    pub fn new(level: &str) -> CompressionConfig {
-        if level == "mobile" {
-            CompressionConfig {
-                image_quality: 70,
-                audio_bitrate_k: 24, // very poor quality
-                video_q_factor: 45,
-            }
-        } else {
-            // Default to Full-HD
-            CompressionConfig {
-                image_quality: 80,
-                audio_bitrate_k: 64,
-                video_q_factor: 60,
-            }
+    pub fn new(level: &str, res_arg: Option<&String>) -> CompressionConfig {
+        // Parse the resolution string into a pixel limit for the longest side
+        let max_resolution_px = match res_arg.map(|s| s.as_str()) {
+            Some("1080p") | Some("1080") => Some(1920),
+            Some("720p") | Some("720") => Some(1280),
+            _ => None,
+        };
+
+        match level.to_lowercase().as_str() {
+            "mobile" => CompressionConfig {
+                img_webp_q: 60, img_jpg_q: 7, audio_bitrate_k: 64,
+                video_x264_crf: 28, video_vp9_crf: 40,
+                max_resolution_px,
+            },
+            _ => CompressionConfig { 
+                img_webp_q: 80, img_jpg_q: 2, audio_bitrate_k: 128,
+                video_x264_crf: 23, video_vp9_crf: 31,
+                max_resolution_px,
+            },
         }
     }
 }
@@ -81,10 +95,10 @@ fn determine_media_type(ext: &str) -> MediaType {
     }
 }
 
-// Check if ffmpeg and cwebp are installed and accessible
+// Check if ffmpeg is installed and accessible
 fn check_dependencies() -> bool {
-    // We removed nconvert from this array
-    let required_tools: [&str; 2] = ["ffmpeg", "cwebp"];
+    // We removed cwebp and nconvert because ffmpeg handles everything now!
+    let required_tools: [&str; 1] = ["ffmpeg"];
     let mut all_tools_found: bool = true;
 
     println!("Checking system dependencies...");
@@ -122,6 +136,23 @@ fn main() -> () {
 
     let args: Args = Args::parse();
 
+    // --- THREAD POOL CONFIGURATION ---
+    // Ask the OS for total logical cores
+    let max_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    
+    // Calculate how many threads to use based on user input
+    let target_threads = match args.threads.as_deref() {
+        Some("max") => max_cores,
+        Some(num_str) => num_str.parse::<usize>().unwrap_or(std::cmp::max(1, max_cores / 2)),
+        None => std::cmp::max(1, max_cores / 2), // Default to 50% capacity
+    };
+    
+    // Mathematically clamp it between 1 and the absolute hardware max
+    let final_threads = target_threads.clamp(1, max_cores);
+    
+    // Lock the global thread pool
+    rayon::ThreadPoolBuilder::new().num_threads(final_threads).build_global().unwrap();
+    
     // Check dependencies before doing anything else
     let deps_ok: bool = check_dependencies();
     if !deps_ok {
@@ -130,8 +161,13 @@ fn main() -> () {
         std::process::exit(1); 
     }
 
-    println!("All dependencies found! Starting file scan...\n");
-    println!("🚀 Rayon parallel engine initialized with {} worker threads.\n", rayon::current_num_threads());
+    // --- CONFIGURATION INIT ---
+    // Pass the optional resolution argument into our config builder
+    let config: CompressionConfig = CompressionConfig::new(&args.mode, args.resolution.as_ref());
+    
+    println!("🚀 Engine initialized with {}/{} CPU threads.", final_threads, max_cores);
+    println!("Target Path: {}", args.path);
+    println!("Using config: {:?}\n", config);
 
     // --- NEW ZIP INTERCEPTION LOGIC ---
     let input_path: &Path = Path::new(&args.path);
@@ -168,12 +204,6 @@ fn main() -> () {
     // Now, instead of &args.path, WalkDir will use our target_dir_path 
     // (which is either the original folder, or our new temporary extracted folder).
     let target_dir: &str = target_dir_path.to_str().expect("Invalid path"); 
-    
-    // Load our configuration dynamically based on the user's -m choice
-    let config: CompressionConfig = CompressionConfig::new(&args.mode);
-    
-    println!("Target Path: {}", target_dir);
-    println!("Using config: {:?}\n", config);
 
     // Prepare our Vectors (Lists) to hold the found files
     let mut image_files: Vec<PathBuf> = Vec::new();
@@ -195,7 +225,7 @@ fn main() -> () {
                     let ext_lower: String = ext_str.to_lowercase();
                     let media_type: MediaType = determine_media_type(&ext_lower);
 
-                    // 5. Route the file to the correct Vector
+                    // Route the file to the correct Vector
                     match media_type {
                         MediaType::Image => image_files.push(path.to_path_buf()),
                         MediaType::Video => video_files.push(path.to_path_buf()),
@@ -207,7 +237,7 @@ fn main() -> () {
         }
     }
 
-    // 6. Print the summary
+    // Print the summary
     println!("Scan Complete:");
     println!("  Images found: {}", image_files.len());
     println!("  Videos found: {}", video_files.len());
@@ -274,11 +304,13 @@ fn main() -> () {
         pb.set_style(pb_style.clone());
 
         audio_files.into_par_iter().for_each(|path| {
+            let ext_osstr = path.extension().expect("File has no extension");
+            let ext_str = ext_osstr.to_str().expect("Invalid extension text").to_lowercase();
             let temp_path: PathBuf = path.with_extension("tmp");
             let orig_size: u64 = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             total_original_bytes.fetch_add(orig_size, Ordering::Relaxed);
             
-            let success: bool = compress_audio(&path, &temp_path, &config);
+            let success: bool = compress_audio(&path, &temp_path, &config, &ext_str);
             
             if success {
                 let new_size: u64 = fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);

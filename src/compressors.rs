@@ -1,100 +1,139 @@
-// src/compressors.rs
-
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::process::{Command, Output};
 use std::path::Path;
 use crate::CompressionConfig;
 
-pub fn compress_audio(input_path: &Path, output_path: &Path, config: &CompressionConfig) -> bool {
-    let input_str: &str = input_path.to_str().expect("Invalid input path");
-    let output_str: &str = output_path.to_str().expect("Invalid output path");
-    let bitrate_str: String = format!("{}k", config.audio_bitrate_k);
+pub fn compress_audio(input_path: &Path, output_path: &Path, config: &CompressionConfig, ext: &str) -> bool {
+    let input_str = input_path.to_str().expect("Invalid input path");
+    let output_str = output_path.to_str().expect("Invalid output path");
+    let bitrate_str = format!("{}k", config.audio_bitrate_k);
 
-    let mut cmd: Command = Command::new("ffmpeg");
-    cmd.args([
-        "-y",
-        "-i", input_str,
-        "-map_metadata", "-1",
-        "-codec:a", "libopus",
-        "-vn", 
-        "-b:a", &bitrate_str,
-        "-compression_level", "10",
-        "-vbr", "on",
-        "-f", "opus", // <-- EXPLICIT FORMAT FIX
-        output_str,
-    ]);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-i", input_str, "-map_metadata", "-1", "-vn"]);
 
+    match ext {
+        "wav" | "opus" => {
+            // .wav gets the Opus trenchcoat. .opus stays Opus.
+            cmd.args(["-c:a", "libopus", "-b:a", &bitrate_str, "-vbr", "on", "-compression_level", "10", "-f", "opus"]);
+        }
+        "ogg" => {
+            cmd.args(["-c:a", "libopus", "-b:a", &bitrate_str, "-vbr", "on", "-f", "ogg"]);
+        }
+        "mp3" => {
+            cmd.args(["-c:a", "libmp3lame", "-b:a", &bitrate_str, "-f", "mp3"]);
+        }
+        _ => return false, // Unsupported audio
+    }
+    
+    cmd.arg(output_str);
     handle_output(cmd.output())
 }
 
 pub fn compress_image(input_path: &Path, output_path: &Path, config: &CompressionConfig, ext: &str) -> bool {
-    let input_str: &str = input_path.to_str().expect("Invalid input path");
-    let output_str: &str = output_path.to_str().expect("Invalid output path");
-    let quality_str: String = config.image_quality.to_string();
+    let input_str = input_path.to_str().expect("Invalid input path");
+    let output_str = output_path.to_str().expect("Invalid output path");
 
-    let mut cmd: Command;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-i", input_str]);
 
-    if ext == "webp" {
-        cmd = Command::new("ffmpeg");
-        cmd.args([
-            "-y", "-i", input_str, "-c:v", "libwebp", "-qscale:v", &quality_str, 
-            "-f", "webp", // <-- EXPLICIT FORMAT FIX
-            output_str
-        ]);
-    } else {
-        cmd = Command::new("cwebp");
-        cmd.args([
-            input_str, "-q", &quality_str, "-m", "5", "-mt", "-o", output_str,
-        ]);
+    let mut is_webp_output = false;
+
+    match ext {
+        "png" | "webp" => {
+            // .png gets the WebP trenchcoat. .webp stays WebP.
+            cmd.args(["-c:v", "libwebp", "-qscale:v", &config.img_webp_q.to_string(), "-f", "webp"]);
+            is_webp_output = true;
+        }
+        "jpg" | "jpeg" => {
+            cmd.args(["-c:v", "mjpeg", "-q:v", &config.img_jpg_q.to_string(), "-f", "image2"]);
+        }
+        _ => return false,
     }
 
-    handle_output(cmd.output())
+    cmd.arg(output_str);
+    let success = handle_output(cmd.output());
+
+    // Natively patch the RIFF header if we generated WebP data
+    if success && is_webp_output {
+        if let Err(e) = fix_webp_header(output_path) {
+            println!("  [WARNING] Failed to patch WebP header on {}: {}", output_path.display(), e);
+        }
+    }
+
+    success
 }
 
 pub fn compress_video(input_path: &Path, output_path: &Path, config: &CompressionConfig, ext: &str) -> bool {
-    let input_str: &str = input_path.to_str().expect("Invalid input path");
-    let output_str: &str = output_path.to_str().expect("Invalid output path");
-    let q_factor_str: String = config.video_q_factor.to_string();
-    let audio_bitrate_str: String = format!("{}k", config.audio_bitrate_k);
+    let input_str = input_path.to_str().expect("Invalid input path");
+    let output_str = output_path.to_str().expect("Invalid output path");
+    let bitrate_str = format!("{}k", config.audio_bitrate_k);
 
-    let mut cmd: Command = Command::new("ffmpeg");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-i", input_str, "-hide_banner"]);
 
-    if ext == "gif" {
-        cmd.args([
-            "-y", "-i", input_str, "-vcodec", "webp", "-pix_fmt", "yuv420p", 
-            "-f", "webp", // <-- EXPLICIT FORMAT FIX
-            output_str,
-        ]);
-    } else {
-        // This one already had "-f webm" in your original script, so it was safe!
-        cmd.args([
-            "-y", "-i", input_str, "-hide_banner", "-c:v", "libvpx-vp9", "-b:v", "0",
-            "-crf", &q_factor_str, "-g", "240", "-vsync", "2", "-row-mt", "1",
-            "-frame-parallel", "1", "-auto-alt-ref", "1", "-lag-in-frames", "25",
-            "-c:a", "libopus", "-vbr", "on", "-compression_level", "10",
-            "-frame_duration", "60", "-application", "audio", "-b:a", &audio_bitrate_str,
-            "-f", "webm", output_str,
-        ]);
+    match ext {
+        "mp4" | "mkv" | "avi" => {
+            cmd.args([
+                "-c:v", "libx264", 
+                "-crf", &config.video_x264_crf.to_string(), 
+                "-preset", "fast", // Faster encoding, good compression
+                "-c:a", "aac", // Universal audio codec for these containers
+                "-b:a", &bitrate_str
+            ]);
+            if ext == "mp4" { cmd.args(["-f", "mp4"]); }
+            else if ext == "mkv" { cmd.args(["-f", "matroska"]); }
+            else { cmd.args(["-f", "avi"]); }
+        }
+        "webm" | "ogv" => {
+            cmd.args([
+                "-c:v", "libvpx-vp9", "-b:v", "0", 
+                "-crf", &config.video_vp9_crf.to_string(), 
+                "-row-mt", "1", "-c:a", "libopus", "-b:a", &bitrate_str, 
+                "-f", "webm"
+            ]);
+        }
+        "gif" => {
+            cmd.args(["-vcodec", "webp", "-pix_fmt", "yuv420p", "-f", "webp"]);
+        }
+        _ => return false,
     }
 
+    cmd.arg(output_str);
     handle_output(cmd.output())
 }
 
-// --- NEW HELPER FUNCTION ---
-// This takes the result of the command execution and gracefully handles errors
+// --- NATIVE WEBP HEADER FIX ---
+// This replaces the Python script. It directly modifies the binary file.
+fn fix_webp_header(path: &Path) -> std::io::Result<()> {
+    let size = fs::metadata(path)?.len();
+    if size < 12 { return Ok(()); } // File is too small to be a valid WebP
+
+    // Open file in Write mode (without truncating it)
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    
+    // Calculate size minus 8 bytes (RIFF specification)
+    let riff_size = (size - 8) as u32;
+    
+    // Jump exactly to the 4th byte
+    file.seek(SeekFrom::Start(4))?;
+    
+    // Overwrite the next 4 bytes with our corrected little-endian integer
+    file.write_all(&riff_size.to_le_bytes())?;
+    
+    Ok(())
+}
+
 fn handle_output(result: Result<Output, std::io::Error>) -> bool {
     match result {
         Ok(output) => {
-            if output.status.success() {
-                true
-            } else {
-                // If FFmpeg fails, extract its error text from stderr and print it
-                let err_msg: String = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() { true } else {
+                let err_msg = String::from_utf8_lossy(&output.stderr).to_string();
                 println!("  [ENCODER ERROR]:\n{}", err_msg.trim());
                 false
             }
         }
         Err(e) => {
-            // This catches OS errors (like if the system forcefully killed the process)
             println!("  [SYSTEM ERROR]: Command failed to execute - {}", e);
             false
         }

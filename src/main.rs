@@ -27,6 +27,7 @@ struct Args {
     #[arg(short = 'p', long = "path", default_value = ".")]
     path: String,
 
+    /// 'mobile' or 'full-hd'
     #[arg(short = 'm', long = "mode", default_value = "full-hd")]
     mode: String,
 

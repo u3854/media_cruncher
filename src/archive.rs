@@ -1,85 +1,179 @@
 use std::fs;
-use std::fs::File;
-use std::io;
-use std::path::Path;
-use zip::read::ZipArchive;
-use zip::write::{FileOptions, ZipWriter};
-// We bring in WalkDir to iterate over the temp folder when repacking
-use walkdir::WalkDir;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-// Extracts a zip file into a target directory.
-// We return a Result so we can easily handle errors if the zip is corrupted.
-pub fn extract_zip(zip_path: &Path, extract_to: &Path) -> Result<(), io::Error> {
-    println!("📦 Extracting archive to temporary workspace...");
-    
-    // Open the zip file for reading
-    let file: File = File::open(zip_path)?;
-    let mut archive: ZipArchive<File> = ZipArchive::new(file)?;
+const SEVEN_ZIP: &str = "7z";
 
-    for i in 0..archive.len() {
-        // We have to use `by_index` to get a mutable reference to each file inside the zip
-        let mut zip_file = archive.by_index(i)?;
-        
-        // Determine where this file should go in our temporary directory
-        // .enclosed_name() prevents "Zip Slip" security vulnerabilities (e.g., paths with "../")
-        let out_path_option = zip_file.enclosed_name();
-        
-        if let Some(out_path) = out_path_option {
-            let full_out_path = extract_to.join(out_path);
+pub fn is_supported_archive(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
 
-            if zip_file.is_dir() {
-                // If the item in the zip is a folder, create that folder in our temp dir
-                fs::create_dir_all(&full_out_path)?;
-            } else {
-                // If it's a file, ensure its parent folder exists, then copy the data
-                if let Some(parent) = full_out_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut out_file: File = File::create(&full_out_path)?;
-                // io::copy reads the bytes from the zip and writes them directly to the new file
-                io::copy(&mut zip_file, &mut out_file)?;
-            }
-        }
-    }
-    Ok(())
+    let name = name.to_lowercase();
+
+    matches!(
+        name.as_str(),
+        s if s.ends_with(".zip")
+            || s.ends_with(".cbz")
+            || s.ends_with(".7z")
+            || s.ends_with(".rar")
+            || s.ends_with(".tar")
+            || s.ends_with(".gz")
+            || s.ends_with(".bz2")
+            || s.ends_with(".xz")
+            || s.ends_with(".tgz")
+            || s.ends_with(".tbz2")
+            || s.ends_with(".txz")
+    ) || name.ends_with(".tar.gz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tar.xz")
 }
 
-// Zips a directory back up into a single file.
-pub fn repack_zip(source_dir: &Path, zip_path: &Path) -> Result<(), io::Error> {
-    println!("\n📦 Repacking archive...");
-    
-    // Open the zip file for writing (this will overwrite the original zip!)
-    let file: File = File::create(zip_path)?;
-    let mut zip_writer: ZipWriter<File> = ZipWriter::new(file);
-    
-    // We use the standard Deflate compression method (standard ZIP)
-    let options: FileOptions<()> = zip::write::FileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+pub fn derive_zip_output_path(input_path: &Path) -> PathBuf {
+    let parent = input_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = input_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
 
-    // Walk through our processed temporary directory
-    for entry_result in WalkDir::new(source_dir) {
-        let entry = entry_result?;
-        let path = entry.path();
-        
-        // We need to figure out the file's path *relative* to the temp folder 
-        // so we don't accidentally zip the entire absolute Linux path (e.g., /tmp/mc_123/images/bg.png -> images/bg.png)
-        let relative_path = path.strip_prefix(source_dir).unwrap_or(path);
-        let relative_path_str: &str = relative_path.to_str().unwrap_or("");
+    let lower = file_name.to_lowercase();
 
-        if path.is_file() {
-            // Tell the zip writer we are starting a new file
-            zip_writer.start_file(relative_path_str, options)?;
-            
-            // Read the processed file from disk and copy it into the zip
-            let mut f: File = File::open(path)?;
-            io::copy(&mut f, &mut zip_writer)?;
-        } else if !relative_path_str.is_empty() {
-            // It's a directory, so we just add a directory marker to the zip
-            zip_writer.add_directory(relative_path_str, options)?;
+    let stem = if lower.ends_with(".tar.gz") {
+        file_name[..file_name.len() - 7].to_string()
+    } else if lower.ends_with(".tar.bz2") {
+        file_name[..file_name.len() - 8].to_string()
+    } else if lower.ends_with(".tar.xz") {
+        file_name[..file_name.len() - 7].to_string()
+    } else if lower.ends_with(".tgz") {
+        file_name[..file_name.len() - 4].to_string()
+    } else if lower.ends_with(".tbz2") {
+        file_name[..file_name.len() - 5].to_string()
+    } else if lower.ends_with(".txz") {
+        file_name[..file_name.len() - 4].to_string()
+    } else if let Some(pos) = file_name.rfind('.') {
+        file_name[..pos].to_string()
+    } else {
+        file_name.to_string()
+    };
+
+    parent.join(format!("{stem}.zip"))
+}
+
+fn archive_failure(action: &str, stderr: &str) -> io::Error {
+    let msg = if stderr.trim().is_empty() {
+        format!("7z failed to {action}")
+    } else {
+        format!("7z failed to {action}:\n{}", stderr.trim())
+    };
+    io::Error::new(io::ErrorKind::Other, msg)
+}
+
+fn looks_password_protected(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("wrong password")
+        || s.contains("can not open encrypted archive")
+        || s.contains("encrypted archive")
+        || s.contains("data error in encrypted file")
+}
+
+fn prompt_for_password() -> io::Result<String> {
+    print!("Archive is password-protected. Enter password: ");
+    io::stdout().flush()?;
+
+    let mut password = String::new();
+    io::stdin().read_line(&mut password)?;
+    Ok(password.trim_end_matches(&['\r', '\n'][..]).to_string())
+}
+
+fn run_7z_extract(archive_path: &Path, extract_to: &Path, password: Option<&str>) -> io::Result<(bool, String)> {
+    let mut cmd = Command::new(SEVEN_ZIP);
+
+    cmd.arg("x")
+        .arg("-y")
+        .arg(format!("-o{}", extract_to.display()));
+
+    if let Some(pw) = password {
+        if !pw.is_empty() {
+            cmd.arg(format!("-p{}", pw));
+        } else {
+            cmd.arg("-p");
         }
     }
 
-    // Finalize the zip file to ensure all bytes are written safely
-    zip_writer.finish()?;
-    Ok(())
+    cmd.arg(archive_path);
+
+    let output = cmd.output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Ok((output.status.success(), stderr))
+}
+
+// Extract any 7z-supported archive into a directory.
+// If the archive is encrypted, prompt the user for a password and retry.
+pub fn extract_archive(archive_path: &Path, extract_to: &Path) -> Result<(), io::Error> {
+    println!("📦 Extracting archive to temporary workspace...");
+
+    let (ok, stderr) = run_7z_extract(archive_path, extract_to, None)?;
+    if ok {
+        return Ok(());
+    }
+
+    if looks_password_protected(&stderr) {
+        for _ in 0..3 {
+            let password = prompt_for_password()?;
+            let (ok_retry, retry_stderr) =
+                run_7z_extract(archive_path, extract_to, Some(password.as_str()))?;
+
+            if ok_retry {
+                return Ok(());
+            }
+
+            if !looks_password_protected(&retry_stderr) {
+                return Err(archive_failure("extract archive", &retry_stderr));
+            }
+
+            println!("Wrong password. Try again.");
+        }
+
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Too many wrong password attempts.",
+        ));
+    }
+
+    Err(archive_failure("extract archive", &stderr))
+}
+
+// Repack the processed directory into a ZIP file with no password.
+pub fn repack_zip(source_dir: &Path, zip_path: &Path) -> Result<(), io::Error> {
+    println!("\n📦 Repacking archive as ZIP...");
+
+    if zip_path.exists() {
+        let _ = fs::remove_file(zip_path);
+    }
+
+    // Add every top-level entry under source_dir. 7z will recurse into directories.
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        entries.push(entry.path());
+    }
+
+    let mut cmd = Command::new(SEVEN_ZIP);
+    cmd.arg("a")
+        .arg("-tzip")
+        .arg("-mx=9")
+        .arg(zip_path)
+        .args(entries.iter().map(|p| p.file_name().unwrap_or_default()))
+        .current_dir(source_dir);
+
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "7z failed to create the ZIP archive.",
+        ))
+    }
 }

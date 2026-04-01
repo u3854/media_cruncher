@@ -2,7 +2,8 @@ mod compressors;
 use compressors::{compress_audio, compress_image, compress_video};
 
 mod archive;
-use archive::{derive_zip_output_path, extract_archive, is_supported_archive, repack_zip};
+// derive_zip_output_path is removed since we replace in place
+use archive::{extract_archive, is_supported_archive, repack_zip};
 
 use tempfile::TempDir;
 use walkdir::{WalkDir, DirEntry};
@@ -153,7 +154,6 @@ fn main() {
 
     let input_path: &Path = Path::new(&args.path);
     let is_archive: bool = input_path.is_file() && is_supported_archive(input_path);
-    let output_archive_path: PathBuf = derive_zip_output_path(input_path);
 
     let _temp_dir_holder: Option<TempDir>;
     let mut target_dir_path: PathBuf = PathBuf::from(&args.path);
@@ -211,6 +211,7 @@ fn main() {
         .expect("Failed to create progress style")
         .progress_chars("#>-");
 
+    // --- Image Processing ---
     if !image_files.is_empty() {
         println!("\n📸 Compressing {} Images...", image_files.len());
         let pb = ProgressBar::new(image_files.len() as u64);
@@ -250,6 +251,7 @@ fn main() {
         pb.finish_with_message("Done!");
     }
 
+    // --- Audio Processing ---
     if !audio_files.is_empty() {
         println!("\n🎵 Compressing {} Audio Files...", audio_files.len());
         let pb = ProgressBar::new(audio_files.len() as u64);
@@ -288,6 +290,7 @@ fn main() {
         pb.finish_with_message("Done!");
     }
 
+    // --- Video Processing ---
     if !video_files.is_empty() {
         println!("\n🎬 Compressing {} Videos...", video_files.len());
         let pb = ProgressBar::new(video_files.len() as u64);
@@ -341,9 +344,35 @@ fn main() {
         println!("  Space Saved   : {} ({:.1}% reduction)", format_bytes(saved_bytes), reduction_percent);
     }
 
+    // --- The In-Place Archive Replacement Logic ---
     if is_archive {
-        repack_zip(&target_dir_path, &output_archive_path)
+        // Determine the final extension. If it's cbz or zip, keep it. 
+        // If it was rar or 7z, we force it to zip so the OS doesn't get confused by the format.
+        let orig_ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let final_ext = match orig_ext.as_str() {
+            "cbz" => "cbz",
+            "zip" => "zip",
+            _ => "zip", 
+        };
+        
+        let final_archive_path = input_path.with_extension(final_ext);
+        
+        // Create a temporary archive file in the same directory as the original
+        let temp_archive_path = input_path.with_extension("tmp.archive");
+
+        repack_zip(&target_dir_path, &temp_archive_path)
             .expect("Failed to repack archive as ZIP");
-        println!("✅ Successfully repacked archive: {}", output_archive_path.display());
+            
+        // If the original file is different from the target file (e.g., we are changing .rar to .zip),
+        // delete the original first to avoid leaving duplicate data.
+        if input_path != final_archive_path {
+            let _ = fs::remove_file(input_path);
+        }
+
+        // Atomically rename the temporary repacked archive over the target path
+        fs::rename(&temp_archive_path, &final_archive_path)
+            .expect("Failed to replace the original archive");
+
+        println!("✅ Successfully updated archive in place: {}", final_archive_path.display());
     }
 }

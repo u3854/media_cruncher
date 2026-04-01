@@ -37,6 +37,12 @@ pub fn compress_image(input_path: &Path, output_path: &Path, config: &Compressio
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-i", input_str]);
 
+    // Apply scaling if a resolution target is set
+    if let Some(max_res) = config.max_resolution_px {
+        let scale_filter = format!("scale={}:{}:force_original_aspect_ratio=decrease", max_res, max_res);
+        cmd.args(["-vf", &scale_filter]);
+    }
+
     let mut is_webp_output = false;
 
     match ext {
@@ -71,6 +77,15 @@ pub fn compress_video(input_path: &Path, output_path: &Path, config: &Compressio
 
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-i", input_str, "-hide_banner"]);
+
+    // Apply scaling and ensure divisible-by-2 dimensions for video encoders
+    if let Some(max_res) = config.max_resolution_px {
+        let scale_filter = format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2", 
+            max_res, max_res
+        );
+        cmd.args(["-vf", &scale_filter]);
+    }
 
     match ext {
         "mp4" | "mkv" | "avi" => {

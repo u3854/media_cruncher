@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 use std::process::Command;
 
 const SEVEN_ZIP: &str = "7z";
@@ -28,36 +28,6 @@ pub fn is_supported_archive(path: &Path) -> bool {
     ) || name.ends_with(".tar.gz")
         || name.ends_with(".tar.bz2")
         || name.ends_with(".tar.xz")
-}
-
-pub fn derive_zip_output_path(input_path: &Path) -> PathBuf {
-    let parent = input_path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = input_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("output");
-
-    let lower = file_name.to_lowercase();
-
-    let stem = if lower.ends_with(".tar.gz") {
-        file_name[..file_name.len() - 7].to_string()
-    } else if lower.ends_with(".tar.bz2") {
-        file_name[..file_name.len() - 8].to_string()
-    } else if lower.ends_with(".tar.xz") {
-        file_name[..file_name.len() - 7].to_string()
-    } else if lower.ends_with(".tgz") {
-        file_name[..file_name.len() - 4].to_string()
-    } else if lower.ends_with(".tbz2") {
-        file_name[..file_name.len() - 5].to_string()
-    } else if lower.ends_with(".txz") {
-        file_name[..file_name.len() - 4].to_string()
-    } else if let Some(pos) = file_name.rfind('.') {
-        file_name[..pos].to_string()
-    } else {
-        file_name.to_string()
-    };
-
-    parent.join(format!("{stem}.zip"))
 }
 
 fn archive_failure(action: &str, stderr: &str) -> io::Error {
@@ -144,36 +114,42 @@ pub fn extract_archive(archive_path: &Path, extract_to: &Path) -> Result<(), io:
     Err(archive_failure("extract archive", &stderr))
 }
 
-// Repack the processed directory into a ZIP file with no password.
 pub fn repack_zip(source_dir: &Path, zip_path: &Path) -> Result<(), io::Error> {
     println!("\n📦 Repacking archive as ZIP...");
 
-    if zip_path.exists() {
-        let _ = fs::remove_file(zip_path);
+    // 1. Force the path to be absolute so 7z doesn't save it in the temp folder
+    let absolute_zip_path = if zip_path.is_absolute() {
+        zip_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(zip_path)
+    };
+
+    if absolute_zip_path.exists() {
+        fs::remove_file(&absolute_zip_path)?;
     }
 
-    // Add every top-level entry under source_dir. 7z will recurse into directories.
-    let mut entries: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(source_dir)? {
-        let entry = entry?;
-        entries.push(entry.path());
-    }
-
-    let mut cmd = Command::new(SEVEN_ZIP);
+    let mut cmd = Command::new("7z");
+    
+    // 2. Use "*" and let 7z handle the files to avoid OS command line length limits
     cmd.arg("a")
         .arg("-tzip")
         .arg("-mx=9")
-        .arg(zip_path)
-        .args(entries.iter().map(|p| p.file_name().unwrap_or_default()))
+        .arg(&absolute_zip_path)
+        .arg("*") 
         .current_dir(source_dir);
 
-    let status = cmd.status()?;
-    if status.success() {
+    let output = cmd.output()?;
+
+    if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "7z failed to create the ZIP archive.",
-        ))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let error_msg = if stderr.trim().is_empty() {
+            "7z failed to create the ZIP archive with no error output.".to_string()
+        } else {
+            format!("7z failed to create the ZIP archive:\n{}", stderr.trim())
+        };
+        
+        Err(io::Error::new(io::ErrorKind::Other, error_msg))
     }
 }

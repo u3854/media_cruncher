@@ -26,9 +26,9 @@ struct Args {
     #[arg(short = 'm', long = "mode", default_value = "full-hd")]
     mode: String,
 
-    /// Optional target resolution: '1080p' or '720p'
+    /// Optional target max resolution in pixels, e.g. 1920 or 1280
     #[arg(short = 'r', long = "resolution")]
-    resolution: Option<String>,
+    resolution: Option<u32>,
 
     /// Number of threads: 'max' or a specific number
     #[arg(short = 't', long = "threads")]
@@ -54,12 +54,7 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    pub fn new(level: &str, res_arg: Option<&String>) -> CompressionConfig {
-        let max_resolution_px = match res_arg.map(|s| s.as_str()) {
-            Some("1080p") | Some("1080") => Some(1920),
-            Some("720p") | Some("720") => Some(1280),
-            _ => None,
-        };
+    pub fn new(level: &str, max_resolution_px: Option<u32>) -> CompressionConfig {
 
         match level.to_lowercase().as_str() {
             "mobile" => CompressionConfig {
@@ -146,7 +141,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let config: CompressionConfig = CompressionConfig::new(&args.mode, args.resolution.as_ref());
+    let config: CompressionConfig = CompressionConfig::new(&args.mode, args.resolution);
 
     println!("🚀 Engine initialized with {}/{} CPU threads.", final_threads, max_cores);
     println!("Target Path: {}", args.path);

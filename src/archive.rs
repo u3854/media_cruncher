@@ -45,6 +45,8 @@ fn looks_password_protected(stderr: &str) -> bool {
         || s.contains("can not open encrypted archive")
         || s.contains("encrypted archive")
         || s.contains("data error in encrypted file")
+        || s.contains("break signaled")
+        || s.contains("headers error")
 }
 
 fn prompt_for_password() -> io::Result<String> {

@@ -33,6 +33,10 @@ struct Args {
     /// Number of threads: 'max' or a specific number
     #[arg(short = 't', long = "threads")]
     threads: Option<String>,
+
+    /// DANGER: Delete all supported media files in the path without compressing
+    #[arg(long = "clean")]
+    clean: bool,
 }
 
 #[derive(Debug)]
@@ -148,7 +152,7 @@ fn main() {
     println!("Using config: {:?}\n", config);
 
     let input_path: &Path = Path::new(&args.path);
-    let is_archive: bool = input_path.is_file() && is_supported_archive(input_path);
+    let is_archive: bool = !args.clean && input_path.is_file() && is_supported_archive(input_path);
 
     let _temp_dir_holder: Option<TempDir>;
     let mut target_dir_path: PathBuf = PathBuf::from(&args.path);
@@ -164,8 +168,10 @@ fn main() {
         extract_archive(input_path, temp_dir.path()).expect("Failed to extract archive");
         target_dir_path = temp_dir.path().to_path_buf();
         _temp_dir_holder = Some(temp_dir);
-    } else {
-        _temp_dir_holder = None;
+    } else if args.clean && input_path.is_file() {
+        // Optional: Warn if they try to --clean a single file instead of a directory
+        println!("❌ Error: --clean expects a directory path, but found a file.");
+        return;
     }
 
     let target_dir: &str = target_dir_path.to_str().expect("Invalid path");
@@ -197,6 +203,35 @@ fn main() {
     println!("  Images found: {}", image_files.len());
     println!("  Videos found: {}", video_files.len());
     println!("  Audio files found: {}", audio_files.len());
+
+    if args.clean {
+        println!("⚠️  CLEAN MODE ACTIVATED: This will permanently delete all identified media.");
+        println!("Found {} images, {} videos, and {} audio files to remove.", 
+            image_files.len(), video_files.len(), audio_files.len());
+        
+        print!("Are you sure you want to proceed? (y/N): ");
+        use std::io::{Write, stdin};
+        std::io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        stdin().read_line(&mut input).unwrap();
+
+        if input.trim().to_lowercase() == "y" {
+            let all_files = [image_files, video_files, audio_files].concat();
+            let pb = ProgressBar::new(all_files.len() as u64);
+            
+            all_files.into_par_iter().for_each(|path| {
+                if let Err(e) = fs::remove_file(&path) {
+                    pb.println(format!("  [ERROR] Could not delete {}: {}", path.display(), e));
+                }
+                pb.inc(1);
+            });
+            pb.finish_with_message("Cleanup complete.");
+        } else {
+            println!("Aborted.");
+        }
+        return; // Exit the program after cleaning
+    }
 
     let total_original_bytes = AtomicU64::new(0);
     let total_final_bytes = AtomicU64::new(0);
